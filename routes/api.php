@@ -10,7 +10,7 @@ use App\Http\Controllers\Api\UserController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\MidtransController;
-
+use App\Http\Controllers\OrderPrintController;
 
 /*
 |--------------------------------------------------------------------------
@@ -50,3 +50,6 @@ Route::middleware('auth:sanctum')->post('/logout', function (Request $request) {
         'message' => 'Logout berhasil, token dihapus.',
     ]);
 });
+
+Route::get('/orders/{id}/print', [OrderPrintController::class, 'print'])
+    ->name('orders.print');

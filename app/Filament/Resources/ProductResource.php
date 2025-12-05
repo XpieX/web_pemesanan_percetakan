@@ -78,7 +78,13 @@ class ProductResource extends Resource
                     ->schema([
                         Checkbox::make('enable_sizes')
                             ->label('Aktifkan ukuran untuk produk ini')
-                            ->reactive(),
+                            ->reactive()
+                            ->afterStateHydrated(function (callable $set, $record) {
+                                // jika edit & ada ukuran → aktifkan
+                                if ($record && $record->sizes()->exists()) {
+                                    $set('enable_sizes', true);
+                                }
+                            }),
 
                         Repeater::make('sizes')
                             ->relationship('sizes')
@@ -86,6 +92,7 @@ class ProductResource extends Resource
                                 TextInput::make('name')
                                     ->label('Nama Ukuran')
                                     ->required(),
+
                                 TextInput::make('price')
                                     ->label('Harga Custom')
                                     ->numeric()
@@ -95,6 +102,7 @@ class ProductResource extends Resource
                             ->visible(fn(callable $get) => $get('enable_sizes') === true),
                     ]),
 
+
                 // ===============================
                 // 🔹 OPSI: AKTIFKAN ADDONS
                 // ===============================
@@ -102,7 +110,13 @@ class ProductResource extends Resource
                     ->schema([
                         Checkbox::make('enable_addons')
                             ->label('Aktifkan addon tambahan')
-                            ->reactive(),
+                            ->reactive()
+                            ->afterStateHydrated(function (callable $set, $record) {
+                                // jika edit & ada addons → aktifkan
+                                if ($record && $record->addons()->exists()) {
+                                    $set('enable_addons', true);
+                                }
+                            }),
 
                         Repeater::make('addons')
                             ->relationship('addons')
@@ -124,6 +138,7 @@ class ProductResource extends Resource
                             ->columns(2)
                             ->visible(fn(callable $get) => $get('enable_addons') === true),
                     ]),
+
             ]);
     }
 

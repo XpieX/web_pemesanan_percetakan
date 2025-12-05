@@ -3,6 +3,9 @@
 use App\Http\Controllers\OrderExportController;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\OrderExportExcelController;
+use App\Http\Controllers\OrderPrintController;
+use App\Http\Controllers\PrintController;
+
 /*
 |--------------------------------------------------------------------------
 | Web Routes
@@ -19,3 +22,5 @@ use App\Http\Controllers\OrderExportExcelController;
 Route::get('/', function () {
     return redirect('/admin/login');
 });
+Route::get('/orders/{id}/print', [PrintController::class, 'print'])
+    ->name('orders.print');

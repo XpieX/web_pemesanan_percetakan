@@ -9,6 +9,8 @@ use App\Models\Customer;
 use App\Models\OrderStatus;
 use App\Models\ProductSize;
 use App\Models\Addon;
+use CodeWithDennis\SimpleAlert\Components\Infolists\SimpleAlert;
+use Filament\Tables\Actions\Action;
 use Filament\Forms;
 use Filament\Forms\Components\Grid;
 use Filament\Forms\Form;
@@ -23,13 +25,14 @@ use Filament\Forms\Components\Section;
 use Filament\Tables\Columns\TextColumn;
 use Filament\Tables\Columns\SelectColumn;
 use Filament\Forms\Components\Toggle;
+use Filament\Notifications\Notification;
+use Filament\Tables\Enums\ActionsPosition;
 
 class OrderResource extends Resource
 {
     protected static ?string $model = Order::class;
     protected static ?string $navigationIcon = 'heroicon-o-shopping-cart';
     protected static ?string $navigationLabel = 'Pesanan';
-
 
     public static function form(Form $form): Form
     {
@@ -51,18 +54,26 @@ class OrderResource extends Resource
                             ->label('Daftar Barang Dipesan')
                             ->schema([
 
-                                // PILIH PRODUK
+                                // === PILIH PRODUK ===
                                 Select::make('product_id')
                                     ->label('Produk')
                                     ->options(Product::pluck('name', 'id'))
                                     ->reactive()
                                     ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                        // Ambil produk baru
                                         $product = Product::with(['sizes', 'addons'])->find($state);
+
+                                        // Reset item fields (set use_preset_size LAST agar visibility re-eval benar)
+                                        $set('product_size_id', null);
+                                        $set('length', null);
+                                        $set('width', null);
+                                        $set('addons', []);
+                                        $set('quantity', 1);
+                                        $set('subtotal', 0);
+
                                         if ($product) {
                                             $set('unit_price', $product->price_per_unit ?? 0);
                                             $set('calculation_type', $product->calculation_type ?? 'quantity');
-                                            $set('quantity', 1);
-                                            $set('subtotal', $product->price_per_unit ?? 0); // ganti total_price → subtotal
                                             $set('available_sizes', $product->sizes->map(fn($s) => [
                                                 'id' => $s->id,
                                                 'name' => $s->name,
@@ -74,14 +85,25 @@ class OrderResource extends Resource
                                                 'name' => $a->name,
                                                 'price' => $a->price,
                                             ])->toArray());
+                                            $set('subtotal', $product->price_per_unit ?? 0);
                                         } else {
                                             $set('unit_price', 0);
                                             $set('subtotal', 0);
                                             $set('available_sizes', []);
                                             $set('available_addons', []);
                                         }
+
+                                        // Trigger visibility re-eval terakhir
+                                        $set('use_preset_size', false);
+
+                                        // update parent subtotal
+                                        $items = $get('../../items') ?? [];
+                                        $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                        $set('../../subtotal', $parent);
+                                        $set('../../total_price', $parent);
                                     }),
 
+                                // === HARGA SATUAN ===
                                 TextInput::make('unit_price')
                                     ->label('Harga Satuan')
                                     ->numeric()
@@ -89,42 +111,230 @@ class OrderResource extends Resource
                                     ->dehydrated(true)
                                     ->required(),
 
+                                // === QUANTITY ===
                                 TextInput::make('quantity')
                                     ->label('Quantity')
-                                    ->step(1)
+                                    ->numeric()
                                     ->default(1)
+                                    ->live(debounce: 200)
+                                    ->visible(fn($get) => $get('calculation_type') === 'quantity')
                                     ->reactive()
                                     ->afterStateUpdated(function ($state, callable $set, callable $get) {
-                                        $price = $get('unit_price') ?? 0;
+                                        $unitPrice = $get('unit_price') ?? 0;
+                                        $quantity = max(1, $state ?? 1);
                                         $addons = $get('addons') ?? [];
                                         $availableAddons = $get('available_addons') ?? [];
-                                        $addonTotal = collect($availableAddons)
+
+                                        $addonTotalPerUnit = collect($availableAddons)
                                             ->whereIn('id', $addons)
                                             ->sum('price');
 
-                                        $set('subtotal', ($price * ($state ?? 0)) + $addonTotal); // hitung subtotal
+                                        // Total = (harga satuan + harga addon per unit) * jumlah
+                                        $subtotal = ($unitPrice + $addonTotalPerUnit) * $quantity;
+                                        $set('subtotal', $subtotal);
+
+                                        // update parent subtotal
+                                        $items = $get('../../items') ?? [];
+                                        $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                        $set('../../subtotal', $parent);
+                                        $set('../../total_price', $parent);
                                     }),
 
-                                // ... kode panjang lainnya tetap sama, tapi semua $set('total_price', ...) ubah jadi $set('subtotal', ...)
+                                // === INPUT PANJANG & LEBAR (untuk area manual) ===
+                                Grid::make(2)
+                                    ->visible(fn($get) =>
+                                    $get('calculation_type') === 'area' &&
+                                        !$get('use_preset_size'))
+                                    ->schema(
+                                        [
+                                            TextInput::make('length')
+                                                ->label('Panjang')
+                                                ->numeric()
+                                                ->live(debounce: 200)
+                                                ->reactive()
+                                                ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                                    // jika preset aktif, abaikan
+                                                    if ($get('use_preset_size')) return;
 
+                                                    $price = $get('unit_price') ?? 0;
+                                                    $length = $get('length') ?? 0;
+                                                    $width = $get('width') ?? 0;
+                                                    $availableAddons = $get('available_addons') ?? [];
+                                                    $addons = $get('addons') ?? [];
+
+                                                    // Addon untuk area dianggap flat (sekali)
+                                                    $addonFlat = collect($availableAddons)
+                                                        ->whereIn('id', $addons)
+                                                        ->sum('price');
+
+                                                    $subtotal = ($price * $length * $width) + $addonFlat;
+                                                    $set('subtotal', $subtotal);
+
+                                                    // update parent subtotal
+                                                    $items = $get('../../items') ?? [];
+                                                    $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                                    $set('../../subtotal', $parent);
+                                                    $set('../../total_price', $parent);
+                                                }),
+
+                                            TextInput::make('width')
+                                                ->label('Lebar')
+                                                ->numeric()
+                                                ->live(debounce: 200)
+                                                ->reactive()
+                                                ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                                    if ($get('use_preset_size')) return;
+
+                                                    $price = $get('unit_price') ?? 0;
+                                                    $length = $get('length') ?? 0;
+                                                    $width = $get('width') ?? 0;
+                                                    $availableAddons = $get('available_addons') ?? [];
+                                                    $addons = $get('addons') ?? [];
+
+                                                    $addonFlat = collect($availableAddons)
+                                                        ->whereIn('id', $addons)
+                                                        ->sum('price');
+
+                                                    $subtotal = ($price * $length * $width) + $addonFlat;
+                                                    $set('subtotal', $subtotal);
+
+                                                    // update parent subtotal
+                                                    $items = $get('../../items') ?? [];
+                                                    $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                                    $set('../../subtotal', $parent);
+                                                    $set('../../total_price', $parent);
+                                                })
+                                        ],
+                                    ),
+
+                                // === TOGGLE GUNAKAN PRESET UKURAN ===
+                                Toggle::make('use_preset_size')
+                                    ->label('Gunakan ukuran yang sudah ada')
+                                    ->visible(fn($get) => !empty($get('available_sizes')))
+                                    ->reactive()
+                                    ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                        if ($state) {
+                                            // ON: pakai preset — biarkan product_size_id boleh diisi oleh user
+                                            // jangan otomatis set product_size_id null
+                                            $set('length', null);
+                                            $set('width', null);
+                                        } else {
+                                            // OFF: kembali ke custom size, kosongkan product_size_id agar tidak tersimpan
+                                            $set('product_size_id', null);
+                                        }
+
+                                        // recalc subtotal parent
+                                        $items = $get('../../items') ?? [];
+                                        $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                        $set('../../subtotal', $parent);
+                                        $set('../../total_price', $parent);
+                                    }),
+
+
+                                // === PILIH UKURAN PRESET ===
+                                Select::make('product_size_id')
+                                    ->label('Pilih Ukuran')
+                                    ->visible(fn($get) => $get('use_preset_size') && !empty($get('available_sizes')))
+                                    ->options(fn($get) => collect($get('available_sizes') ?? [])->mapWithKeys(
+                                        fn($s) => [$s['id'] => "{$s['name']} ({$s['unit']}) - Rp{$s['price']}"]
+                                    ))
+                                    ->reactive()
+                                    ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                        $sizes = $get('available_sizes') ?? [];
+                                        $selected = collect($sizes)->firstWhere('id', $state);
+                                        if (!$selected) return;
+
+                                        $price = $selected['price'];
+                                        // Set harga satuan ke harga preset (treated as FLAT)
+                                        $set('unit_price', $price);
+                                        // Pastikan length/width tidak mengganggu
+                                        $set('length', null);
+                                        $set('width', null);
+
+                                        $availableAddons = $get('available_addons') ?? [];
+                                        $addons = $get('addons') ?? [];
+                                        $addonFlat = collect($availableAddons)->whereIn('id', $addons)->sum('price');
+
+                                        if ($get('calculation_type') === 'area') {
+                                            // A: preset treated as final flat price
+                                            $subtotal = $price + $addonFlat;
+                                        } else {
+                                            $quantity = $get('quantity') ?? 1;
+                                            $addonPerUnit = collect($availableAddons)->whereIn('id', $addons)->sum('price');
+                                            $subtotal = ($price + $addonPerUnit) * $quantity;
+                                        }
+
+                                        $set('subtotal', $subtotal);
+
+                                        // update parent subtotal
+                                        $items = $get('../../items') ?? [];
+                                        $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                        $set('../../subtotal', $parent);
+                                        $set('../../total_price', $parent);
+                                    }),
+
+                                // === ADDONS ===
+                                Select::make('addons')
+                                    ->label('Addon Tambahan')
+                                    ->visible(fn($get) => !empty($get('available_addons')))
+                                    ->multiple()
+                                    ->options(fn($get) => collect($get('available_addons') ?? [])->mapWithKeys(
+                                        fn($a) => [$a['id'] => "{$a['name']} (+Rp{$a['price']})"]
+                                    ))
+                                    ->reactive()
+                                    ->live()
+                                    ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                        $calcType = $get('calculation_type');
+                                        $availableAddons = $get('available_addons') ?? [];
+                                        $addonTotal = collect($availableAddons)
+                                            ->whereIn('id', $state ?? [])
+                                            ->sum('price');
+
+                                        $price = $get('unit_price') ?? 0;
+                                        $quantity = $get('quantity') ?? 1;
+
+                                        if ($calcType === 'quantity') {
+                                            // addons considered per-unit
+                                            $subtotal = ($price + $addonTotal) * $quantity;
+                                        } else {
+                                            if ($get('use_preset_size')) {
+                                                // preset for area -> flat price + addon (addon flat)
+                                                $subtotal = $price + $addonTotal;
+                                            } else {
+                                                $length = $get('length') ?? 0;
+                                                $width = $get('width') ?? 0;
+                                                $subtotal = ($price * $length * $width) + $addonTotal;
+                                            }
+                                        }
+
+                                        $set('subtotal', $subtotal);
+
+                                        // update parent subtotal
+                                        $items = $get('../../items') ?? [];
+                                        $parent = collect($items)->sum(fn($i) => $i['subtotal'] ?? 0);
+                                        $set('../../subtotal', $parent);
+                                        $set('../../total_price', $parent);
+                                    }),
+
+                                // === SUBTOTAL ITEM ===
                                 TextInput::make('subtotal')
                                     ->label('Subtotal Item')
                                     ->numeric()
                                     ->disabled()
-                                    ->dehydrated(true) // wajib agar ikut disimpan ke DB
+                                    ->dehydrated(true)
                                     ->default(0),
+
                             ])
                             ->reactive()
                             ->afterStateUpdated(function ($state, callable $set) {
-                                // hitung subtotal semua item
-                                $subtotal = collect($state ?? [])->sum(fn($item) => $item['subtotal'] ?? 0);
-                                $set('subtotal', $subtotal);
-                                $set('total_price', $subtotal);
+                                // Update subtotal pesanan (parent) setiap ada perubahan di repeater structure
+                                $subtotalAkhir = collect($state ?? [])->sum(fn($item) => $item['subtotal'] ?? 0);
+                                $set('../../subtotal', $subtotalAkhir);
+                                $set('../../total_price', $subtotalAkhir);
                             })
                             ->defaultItems(1)
                             ->columnSpanFull()
                             ->addActionLabel('Tambah Barang'),
-
 
                         // SUBTOTAL
                         TextInput::make('subtotal')
@@ -132,8 +342,8 @@ class OrderResource extends Resource
                             ->numeric()
                             ->default(0)
                             ->disabled()
+                            ->formatStateUsing(fn($state) => (float) $state)
                             ->dehydrated(true),
-
 
                         // DISKON
                         TextInput::make('discount')
@@ -141,6 +351,7 @@ class OrderResource extends Resource
                             ->numeric()
                             ->default(0)
                             ->reactive()
+                            ->formatStateUsing(fn($state) => (float) $state)
                             ->afterStateUpdated(function ($state, callable $set, callable $get) {
                                 $subtotal = $get('subtotal') ?? 0;
                                 $discount = $state ?? 0;
@@ -150,11 +361,14 @@ class OrderResource extends Resource
                         Textarea::make('note')
                             ->label('Catatan')
                             ->rows(2),
+
                         // TOTAL
                         TextInput::make('total_price')
                             ->label('Total Akhir')
                             ->numeric()
                             ->default(0)
+                            ->formatStateUsing(fn($state) => (int) $state)
+
                             ->disabled()
                             ->dehydrated(true),
 
@@ -162,54 +376,132 @@ class OrderResource extends Resource
             ]);
     }
 
+
     public static function table(Table $table): Table
     {
-        return $table
-            ->columns([
-                TextColumn::make('id')
-                    ->label('No')
-                    ->sortable(),
+        // ambil map status name => id sekali
+        $statusMap = OrderStatus::pluck('id', 'name')->toArray();
+        $selesaiId = $statusMap['Selesai'] ?? null;
+        $batalId   = $statusMap['Batal'] ?? null;
 
-                TextColumn::make('customer.name')
+        $query = Order::query();
+        if ($batalId !== null) {
+            // hide yang batal
+            $query->where('status_id', '!=', $batalId);
+        }
+
+        return $table
+            ->query($query)
+            ->columns([
+                TextColumn::make("status.name")
+                    ->label("Status")
+                    ->color(fn($state) => match ($state) {
+                        'Selesai' => 'success',
+                        'Proses'  => 'warning',
+                        'Batal'   => 'danger',
+                        default   => 'gray',
+                    }),
+                TextColumn::make("no")->label("No")->rowIndex(),
+
+                Tables\Columns\TextColumn::make('customer.name')
                     ->label('Customer')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('order_date')
+                    ->label('Tanggal Pemesanan')
+                    ->date('l, d M Y')
                     ->sortable()
                     ->searchable(),
 
-                SelectColumn::make('status_id')
-                    ->label('Status')
-                    ->options(OrderStatus::pluck('name', 'id'))
-                    ->afterStateUpdated(fn($record, $state) => $record->update(['status_id' => $state]))
-                    ->extraAttributes(function ($record) {
-                        $status = $record->status?->name;
-                        return match ($status) {
-                            'Pending' => ['class' => 'bg-yellow-200 text-yellow-800 dark:bg-yellow-700 dark:text-yellow-100 font-semibold rounded-lg'],
-                            'Processing' => ['class' => 'bg-blue-200 text-blue-800 dark:bg-blue-700 dark:text-blue-100 font-semibold rounded-lg'],
-                            'Completed' => ['class' => 'bg-green-200 text-green-800 dark:bg-green-700 dark:text-green-100 font-semibold rounded-lg'],
-                            'Cancelled' => ['class' => 'bg-red-200 text-red-800 dark:bg-red-700 dark:text-red-100 font-semibold rounded-lg'],
-                            default => ['class' => 'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-100'],
-                        };
-                    }),
+                // ---------------------------
+                // ORDER ITEMS (PRODUCTS)
+                // ---------------------------
+                Tables\Columns\TextColumn::make('items.product.name')
+                    ->label('Nama Barang')
+                    ->listWithLineBreaks()      // tampil per baris
+                    ->limitList(10),            // optional
 
-                TextColumn::make('order_date')
-                    ->label('Order Date')
-                    ->dateTime('d M Y H:i')
-                    ->sortable(),
+                TextColumn::make('orderItems')
+                    ->label('Ukuran')
+                    ->getStateUsing(function ($record) {
 
-                TextColumn::make('total_price')
+                        if (!$record->orderItems || $record->orderItems->isEmpty()) {
+                            return ['-'];
+                        }
+
+                        return $record->orderItems->map(function ($item) {
+
+                            $width  = (int) $item->width;
+                            $length = (int) $item->length;
+
+                            if (empty($width) || empty($length)) {
+                                return $item->productSize->name ?? '-';
+                            }
+
+                            return "{$width} x {$length} cm";
+                        })->toArray(); // ← penting: jadikan array, bukan string
+
+                    })
+                    ->separator("\n")         // ← setiap item dipisah newline
+                    ->listWithLineBreaks()    // ← Filament render newline sebagai <br>
+                    ->extraAttributes(['class' => 'text-center'])
+                    ->wrap()->alignment('center'),
+
+                Tables\Columns\TextColumn::make('items.quantity')
+                    ->label('Qty')
+                    ->numeric()
+                    ->listWithLineBreaks(),
+
+                Tables\Columns\TextColumn::make('items.subtotal')
+                    ->label('Subtotal')
+                    ->money('idr')
+                    ->listWithLineBreaks(),
+                Tables\Columns\TextColumn::make('discount')
+                    ->label('Diskon')
+                    ->money('idr'),
+                Tables\Columns\TextColumn::make('total_price')
                     ->label('Total')
-                    ->money('IDR', true),
+                    ->money('idr')
+                    ->listWithLineBreaks(),
             ])
-            ->defaultSort('id', 'desc')
             ->actions([
-                Tables\Actions\ViewAction::make(),
-                Tables\Actions\EditAction::make(),
-                Tables\Actions\DeleteAction::make(),
-            ])
-            ->bulkActions([
-                Tables\Actions\DeleteBulkAction::make(),
-            ]);
-    }
 
+                Tables\Actions\ActionGroup::make([
+                    Action::make('print')
+                        ->label('Print')
+                        ->icon('heroicon-o-printer')
+                        ->url(fn($record) => route('orders.print', $record))
+                        ->openUrlInNewTab(),
+
+                    Action::make('changeStatus')
+                        ->label('Ubah Status')
+                        ->icon('heroicon-o-pencil')
+                        ->visible(fn($record) => ! in_array($record->status_id, array_filter([$selesaiId, $batalId])))
+                        ->form([
+                            Forms\Components\Select::make('status_id')
+                                ->label('Pilih Status')
+                                ->options(OrderStatus::pluck('name', 'id')->toArray()),
+                        ])
+                        ->modalHeading('Ubah Status Pesanan')
+                        ->modalSubmitActionLabel('Ubah')
+                        ->requiresConfirmation()
+                        ->action(function (array $data, $record, $livewire) use ($selesaiId, $batalId) {
+                            $new = $data['status_id'];
+                            $record->update(['status_id' => $new]);
+
+                            Notification::make()
+                                ->title('Status Diubah')
+                                ->success()
+                                ->send();
+
+                            $livewire->dispatch('refreshTable');
+                        }),
+                ])
+                    ->icon('heroicon-o-ellipsis-vertical') // ikon group
+                    ->label('Actions')
+            ], position: ActionsPosition::BeforeColumns)
+            // ⬅️ membuat action pindah ke kir
+            ->defaultSort('id', 'desc');
+    }
     public static function getPages(): array
     {
         return [
